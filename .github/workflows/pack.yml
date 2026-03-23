@@ -40,9 +40,8 @@ jobs:
       semantic_version: ${{ inputs.semantic_version }}
       dry_run: true
 
-  pack-archives:
-    runs-on:
-      group: zitadel-public
+  pack:
+    runs-on: ubuntu-22.04
     environment: ${{ github.ref_protected == 'true' && 'Protected' || null }}
     needs: version
     permissions:
@@ -89,7 +88,7 @@ jobs:
     runs-on:
       group: zitadel-public
     environment: ${{ github.ref_protected == 'true' && 'Protected' || null }}
-    needs: [version, pack-archives]
+    needs: [version, pack]
     permissions:
       contents: read
       packages: write
@@ -142,31 +141,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Login to Google Artifact Registry
-        uses: docker/login-action@v3
-        with:
-          registry: europe-docker.pkg.dev
-          username: _json_key_base64
-          password: ${{ secrets.GCR_JSON_KEY_BASE64 }}
-      - name: Set API image names
-        id: api-images
-        run: |
-          if [ "${{ matrix.push_ghcr }}" = "true" ]; then
-            {
-              echo "${{ inputs.image_name_github_api }}"
-              echo "${{ inputs.image_name_google_api }}"
-            } > api-images.txt
-          else
-            echo "${{ inputs.image_name_google_api }}" > api-images.txt
-          fi
-          echo "list<<EOF" >> "$GITHUB_OUTPUT"
-          cat api-images.txt >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
       - name: Generate Standard Tags and Labels from the GitHub Context for the API Scratch Container Image
         id: scratch-meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ steps.api-images.outputs.list }}
+          images: |
+            ${{ inputs.image_name_github_api }}
           labels: ${{ env.default_labels}}
           tags: |
             type=sha,prefix=,suffix=${{ matrix.tag_suffix }},format=long
@@ -188,7 +168,8 @@ jobs:
         id: debug-meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ steps.api-images.outputs.list }}
+          images: |
+            ${{ inputs.image_name_github_api }}
           labels: ${{ env.default_labels}}
           tags: |
             type=sha,prefix=,suffix=${{ matrix.tag_suffix }}-debug,format=long
@@ -232,7 +213,6 @@ jobs:
         with:
           images: |
             ${{ inputs.image_name_github_login }}
-            ${{ inputs.image_name_google_login }}
           labels: |
             org.opencontainers.image.licenses=MIT
             ${{ env.default_labels}}
