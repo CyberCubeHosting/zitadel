@@ -216,7 +216,7 @@ func assertRoles(projectID string, user *query.OIDCUserInfo, roleAudience, reque
 func userInfoEmailToOIDC(user *query.User) oidc.UserInfoEmail {
 	if human := user.Human; human != nil {
 		return oidc.UserInfoEmail{
-			Email:         string(human.Email),
+			Email:         string(user.PreferredLoginName),
 			EmailVerified: oidc.Bool(human.IsEmailVerified),
 		}
 	}

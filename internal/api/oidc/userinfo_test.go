@@ -323,7 +323,7 @@ func Test_userInfoToOIDC(t *testing.T) {
 			want: &oidc.UserInfo{
 				Subject: "human1",
 				UserInfoEmail: oidc.UserInfoEmail{
-					Email:         "foo@bar.com",
+					Email:         "foo",
 					EmailVerified: true,
 				},
 			},
