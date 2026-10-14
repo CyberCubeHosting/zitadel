@@ -85,8 +85,7 @@ jobs:
           path: .artifacts/pack
 
   docker:
-    runs-on:
-      group: zitadel-public
+    runs-on: ubuntu-22.04
     environment: ${{ github.ref_protected == 'true' && 'Protected' || null }}
     needs: [version, pack]
     permissions:
