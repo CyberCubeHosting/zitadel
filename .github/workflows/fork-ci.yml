@@ -1,0 +1,371 @@
+# Fork CI for our Zitadel fork.
+#
+# Replaces upstream's ci.yml / pack.yml / release.yml / version.yml, which depend on
+# Zitadel's own infrastructure (Nx Cloud, Codecov, Google Artifact Registry,
+# semantic-release, GitHub App tokens, "Protected" environment, Depot runners).
+#
+# Kept under its own file name so upstream syncs never conflict with it.
+# Disable the upstream workflows in the Actions UI (or with `gh workflow disable`)
+# instead of editing/deleting them.
+#
+# What it does:
+#   pull_request        -> lint/test/build (nx affected), no images
+#   push to main / v*.x -> lint/test/build, then images tagged <sha>, <version>, <branch>
+#   push tag v*         -> lint/test/build, then images tagged <sha>, <tag>, latest
+#   workflow_dispatch   -> same as a push, optionally skipping tests
+#
+# Images:
+#   ghcr.io/<owner>/<repo>/zitadel          (API, scratch-based)
+#   ghcr.io/<owner>/<repo>/zitadel:*-debug  (API, builder stage with shell/tools)
+#   ghcr.io/<owner>/<repo>/zitadel-login    (Login v2)
+
+name: Fork CI
+
+on:
+  push:
+    branches:
+      - main
+      - "patches/**"
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: Run lint/test/build (incl. integration tests) before publishing
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Only cancel superseded PR runs; never kill a run that is pushing images.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "22"
+  # Untagged builds get versions like v4.6.2-fork.57 (base = nearest upstream tag).
+  FORK_SUFFIX: fork
+  # Nx Cloud is Zitadel's remote cache; we have no token, so run purely locally.
+  NX_NO_CLOUD: "true"
+  NX_DAEMON: "false"
+  NX_DISABLE_DB: "true"
+
+jobs:
+  version:
+    name: Determine version
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: tree:0
+
+      - name: Compute version
+        id: v
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="$GITHUB_REF_NAME"
+          else
+            if BASE="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null)"; then
+              :
+            else
+              echo "::warning::No upstream v* tags found in this repo. Push them with: git fetch upstream --tags && git push origin --tags"
+              BASE="v0.0.0"
+            fi
+            # No '+' build metadata: it is not a valid character in Docker tags.
+            VERSION="${BASE}-${FORK_SUFFIX}.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "### Version: \`${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    name: Lint, Test and Build
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_tests }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read # nx-set-shas queries previous workflow runs
+    steps:
+      - name: Free disk space on runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: tree:0
+
+      - name: Fetch main branch
+        if: ${{ github.ref != 'refs/heads/main' }}
+        run: git fetch origin main:main
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Set up Docker
+        uses: docker/setup-docker-action@v4
+        with:
+          version: v28.3.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: v0.28.0
+
+      - name: Set up Docker Compose
+        uses: docker/setup-compose-action@v1
+        with:
+          version: v2.38.2
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Integration tests rely on systemd-resolved synthesising *.integration.localhost.
+      # GitHub-hosted runners already use the stub resolver; this is a no-op safeguard.
+      - name: Ensure *.localhost resolution via systemd-resolved stub
+        run: |
+          set -ex
+          test -e /run/systemd/resolve/stub-resolv.conf
+          sudo ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+          getent hosts foo.integration.localhost
+
+      - name: Set SHAs for nx affected (PRs only)
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: nrwl/nx-set-shas@v4
+
+      - name: Lint, Test and Build (affected)
+        if: ${{ github.event_name == 'pull_request' }}
+        run: pnpm nx affected --nxBail --targets test build --exclude @zitadel/docs
+
+      # On pushes, test everything: after an upstream sync "affected" is unreliable
+      # and there may be no previous successful run in the fork to diff against.
+      - name: Lint, Test and Build (all)
+        if: ${{ github.event_name != 'pull_request' }}
+        run: pnpm nx run-many --targets test build --exclude @zitadel/docs,@zitadel/functional-ui
+
+      - name: Functional UI tests (non-blocking)
+        if: ${{ github.event_name != 'pull_request' }}
+        continue-on-error: true
+        run: pnpm nx run @zitadel/functional-ui:test
+
+      - name: Check for uncommitted changes (Codegen mismatch)
+        run: git diff --exit-code
+
+      - name: Upload API Integration Test Race Logs
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-integration-test-race-logs
+          path: .artifacts/api-test-integration/race.log.*
+          if-no-files-found: ignore
+
+      - name: Upload Functional UI Test Artifacts
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: functional-ui-tests
+          path: |
+            tests/functional-ui/cypress/screenshots
+            tests/functional-ui/cypress/videos
+            tests/functional-ui/cypress/results
+          if-no-files-found: ignore
+
+  images:
+    name: Build and Push Images
+    needs: [version, test]
+    # always() so a skipped test job (run_tests=false) does not skip publishing.
+    if: |
+      always() &&
+      github.event_name != 'pull_request' &&
+      needs.version.result == 'success' &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Free disk space on runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: tree:0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Image names (GHCR requires lowercase)
+        id: names
+        run: |
+          repo="${GITHUB_REPOSITORY,,}"
+          echo "api=ghcr.io/${repo}/zitadel" >> "$GITHUB_OUTPUT"
+          echo "login=ghcr.io/${repo}/zitadel-login" >> "$GITHUB_OUTPUT"
+
+      - name: Build Linux API binaries
+        env:
+          ZITADEL_VERSION: ${{ needs.version.outputs.version }}
+          ZITADEL_GOFIPS140: "off"
+        run: pnpm nx run-many --nxBail -p @zitadel/api -t pack-linux-amd64,pack-linux-arm64
+
+      - name: Build Login standalone
+        run: pnpm nx run --nxBail @zitadel/login:build
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: v0.28.0
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---------- API (scratch / final stage) ----------
+      - name: Metadata for API image
+        id: api-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.names.outputs.api }}
+          flavor: |
+            latest=false
+          labels: |
+            org.opencontainers.image.documentation=https://zitadel.com/docs
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+          tags: |
+            type=sha,prefix=,format=long
+            type=raw,value=${{ needs.version.outputs.version }}
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build and push API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          target: final
+          platforms: linux/amd64,linux/arm64
+          push: true
+          cache-from: type=gha,scope=api-scratch
+          cache-to: type=gha,mode=max,scope=api-scratch
+          labels: ${{ steps.api-meta.outputs.labels }}
+          tags: ${{ steps.api-meta.outputs.tags }}
+
+      # ---------- API (debug / builder stage) ----------
+      - name: Metadata for API debug image
+        id: api-debug-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.names.outputs.api }}
+          flavor: |
+            latest=false
+            suffix=-debug
+          labels: |
+            org.opencontainers.image.documentation=https://zitadel.com/docs
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+          tags: |
+            type=sha,prefix=,format=long
+            type=raw,value=${{ needs.version.outputs.version }}
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build and push API debug image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          target: builder
+          platforms: linux/amd64,linux/arm64
+          push: true
+          cache-from: type=gha,scope=api-debug
+          cache-to: type=gha,mode=max,scope=api-debug
+          labels: ${{ steps.api-debug-meta.outputs.labels }}
+          tags: ${{ steps.api-debug-meta.outputs.tags }}
+
+      # ---------- Login ----------
+      - name: Metadata for Login image
+        id: login-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.names.outputs.login }}
+          flavor: |
+            latest=false
+          labels: |
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.documentation=https://zitadel.com/docs
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+          tags: |
+            type=sha,prefix=,format=long
+            type=raw,value=${{ needs.version.outputs.version }}
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build and push Login image
+        uses: docker/build-push-action@v6
+        with:
+          context: apps/login
+          platforms: linux/amd64,linux/arm64
+          push: true
+          cache-from: type=gha,scope=login
+          cache-to: type=gha,mode=max,scope=login
+          labels: ${{ steps.login-meta.outputs.labels }}
+          tags: ${{ steps.login-meta.outputs.tags }}
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published images"
+            echo '```'
+            echo "${{ steps.api-meta.outputs.tags }}"
+            echo "${{ steps.api-debug-meta.outputs.tags }}"
+            echo "${{ steps.login-meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
