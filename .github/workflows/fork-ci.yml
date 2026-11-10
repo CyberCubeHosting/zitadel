@@ -89,7 +89,7 @@ jobs:
     name: Lint, Test and Build
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_tests }}
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    timeout-minutes: 180
     permissions:
       contents: read
       actions: read # nx-set-shas queries previous workflow runs
@@ -164,6 +164,8 @@ jobs:
       # and there may be no previous successful run in the fork to diff against.
       - name: Lint, Test and Build (all)
         if: ${{ github.event_name != 'pull_request' }}
+        env:
+          GOFLAGS: -p=2
         run: pnpm nx run-many --targets test build --exclude @zitadel/docs,@zitadel/functional-ui
 
       - name: Functional UI tests (non-blocking)
